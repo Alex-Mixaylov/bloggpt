@@ -1,0 +1,122 @@
+import re
+
+src = input_data.get("gpt_text", "") or ""
+
+# ---------- helpers ----------
+def escape_md_v2(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\\", "\\\\")
+    return re.sub(r"([_*[\]()~`>#+\-=|{}.!])", r"\\\1", s)
+
+def stash(pattern, text, store, token_prefix, keep_group=None, flags=0):
+    def _keep(m):
+        if keep_group is None:
+            store.append(m.group(0))
+        else:
+            store.append(m.group(keep_group))
+        return f"{token_prefix}{len(store)-1}ZP"
+    return re.sub(pattern, _keep, text, flags=flags)
+
+def restore(text, store, token_prefix):
+    return re.sub(fr"{token_prefix}(\d+)ZP", lambda m: store[int(m.group(1))], text)
+
+# ---------- 1) stash блоки, которые нельзя портить ----------
+urls, code_blocks, code_inline, bold_inners = [], [], [], []
+
+# ```тройные код-блоки``` (с опциональным языком)
+src = stash(r"```[ \t]*[a-zA-Z0-9_-]*\n.*?\n```", src, code_blocks, "ZPCODEBLK", flags=re.DOTALL)
+# `инлайн-код`
+src = stash(r"`[^`\n]+`", src, code_inline, "ZPCODE")
+# http/https ссылки
+src = stash(r"https?://[^\s)]+", src, urls, "ZPURL")
+# жирный **...** (сохраняем только внутренний текст, без **)
+src = stash(r"\*\*([^*\n]+)\*\*", src, bold_inners, "ZPBOLD", keep_group=1)
+
+# ---------- 2) конвертируем #-заголовки в жирный ----------
+def convert_headings(text: str) -> str:
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*#{1,6}\s+(.*)$", line)
+        if m:
+            out.append(f"*{escape_md_v2(m.group(1))}*")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+src = convert_headings(src)
+
+# --- 2.1) защитим строковые заголовки вида *...* перед экранированием ---
+heading_inners = []
+
+def stash_bold_lines(text: str) -> str:
+    def _keep(m):
+        inner = m.group(1)
+        heading_inners.append(inner)
+        return f"ZPHEAD{len(heading_inners)-1}ZP"
+    # целые строки формата *Заголовок*
+    return re.sub(r'^\*([^\n*]+)\*\s*$', _keep, text, flags=re.MULTILINE)
+
+def restore_bold_lines(text: str) -> str:
+    def _put(m):
+        idx = int(m.group(1))
+        return f"*{escape_md_v2(heading_inners[idx])}*"
+    return re.sub(r'ZPHEAD(\d+)ZP', _put, text)
+
+src = stash_bold_lines(src)
+
+# ---------- 3) экранируем остальное ----------
+src = escape_md_v2(src)
+
+# ---------- 4) восстанавливаем ----------
+# жирный: превращаем сохранённые внутренности в *...*
+def restore_bold(text: str) -> str:
+    def repl(m):
+        idx = int(m.group(1))
+        inner = escape_md_v2(bold_inners[idx])
+        return f"*{inner}*"
+    return re.sub(r"ZPBOLD(\d+)ZP", repl, text)
+
+# инлайн-код: `...` (экранируем \ и ` внутри)
+def restore_code_inline(text: str) -> str:
+    def repl(m):
+        idx = int(m.group(1))
+        raw = code_inline[idx][1:-1]  # убрать обрамляющие `
+        inner = raw.replace("\\", "\\\\").replace("`", "\\`")
+        return f"`{inner}`"
+    return re.sub(r"ZPCODE(\d+)ZP", repl, text)
+
+# код-блоки: ```\n...\n``` (без экранирования внутри)
+def restore_code_blocks(text: str) -> str:
+    def repl(m):
+        idx = int(m.group(1))
+        raw = code_blocks[idx]
+        body = re.sub(r"^```[^\n]*\n|\n```$", "", raw, flags=re.DOTALL)
+        return f"```\n{body}\n```"
+    return re.sub(r"ZPCODEBLK(\d+)ZP", repl, text)
+
+# ссылки: возвращаем как есть
+src = restore_bold(src)
+src = restore_code_inline(src)
+src = restore_code_blocks(src)
+src = restore(src, urls, "ZPURL")
+
+# восстановить защищённые жирные строки-заголовки (*...*)
+src = restore_bold_lines(src)
+
+# подчистить хвостовые пробелы внутри *...*
+def normalize_bold_headings(text: str) -> str:
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        m = re.match(r'^\*([^\n*]+?)\s*\*\s*$', line)
+        if m:
+            inner = m.group(1).strip()
+            out.append(f"*{inner}*")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+src = normalize_bold_headings(src)
+
+output = {"text": src, "preview": src[:200]}
